@@ -4,19 +4,27 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import kotlinx.coroutines.launch
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
+import kotlin.time.Duration.Companion.milliseconds
 
 
 @HiltViewModel
 class MainViewModel @Inject constructor(
     private val apiService: ApiService
 ) : ViewModel() {
-
     private val _schemeList = MutableStateFlow<List<Scheme>>(emptyList())
     val schemeList: StateFlow<List<Scheme>> = _schemeList
 
@@ -31,10 +39,63 @@ class MainViewModel @Inject constructor(
 
     private var allSchemes: List<Scheme> = emptyList()
 
+    private val _chartData = MutableStateFlow<List<Pair<String, Double>>>(emptyList())
+    val chartData: StateFlow<List<Pair<String, Double>>> = _chartData
+
+    private val _searchResults = MutableStateFlow<List<Scheme>>(emptyList())
+    val searchResults: StateFlow<List<Scheme>> = _searchResults
+
+    private val _isSearching = MutableStateFlow(false)
+    val isSearching: StateFlow<Boolean> = _isSearching
+
+    private val searchQuery = MutableStateFlow("")
+
+    private var searchJob: Job? = null
+
     init {
         fetchAllSchemes()
+        setupSearchFlow()
+    }
+    @OptIn(FlowPreview::class)
+    private fun setupSearchFlow() {
+        viewModelScope.launch {
+            searchQuery
+                .debounce(300.milliseconds) // Debounce typing events
+                .filter { it.length >= 3 } // Only process queries with 3 or more chars
+                .distinctUntilChanged()
+                .onEach { _isSearching.value = true }
+                .mapLatest { query ->
+                    performSearch(query)
+                }
+                .catch { e ->
+                    _error.value = "Search failed: ${e.message}"
+                }
+                .collect { results ->
+                    _searchResults.value = results
+                    _isSearching.value = false
+                }
+        }
     }
 
+    private suspend fun performSearch(query: String): List<Scheme> {
+        return withContext(Dispatchers.Default) {
+            allSchemes
+                .asSequence()
+                .filter {
+                    it.schemeName.contains(query, ignoreCase = true) ||
+                            it.schemeCode.toString().contains(query)
+                }
+                .take(50) // Limit results for better performance
+                .toList()
+        }
+    }
+
+    fun onSearchQueryChanged(query: String) {
+        searchQuery.value = query
+        if (query.length < 3) {
+            _searchResults.value = emptyList()
+        }
+    }
     private fun fetchAllSchemes() {
         viewModelScope.launch {
             try {
@@ -67,13 +128,14 @@ class MainViewModel @Inject constructor(
         _selectedSchemeDetail.value = null
     }
 
-
     fun fetchSchemeDetails(schemeCode: Int) {
         viewModelScope.launch {
             try {
                 _isLoading.value = true
                 _error.value = null
-                _selectedSchemeDetail.value = apiService.getSchemeDetails(schemeCode)
+                val schemeDetail = apiService.getSchemeDetails(schemeCode)
+                _selectedSchemeDetail.value = schemeDetail
+                updateChartData(schemeDetail.data)
                 Log.d("MainViewModel", "Fetched scheme details successfully for code: $schemeCode")
             } catch (e: Exception) {
                 Log.e("MainViewModel", "Error fetching scheme details: ${e.message}")
@@ -84,4 +146,11 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    private fun updateChartData(data: List<NAVData>) {
+        val chartData = data.mapIndexed { index, navData ->
+            navData.date to navData.nav.toDouble()
+        }
+        _chartData.value = chartData
+    }
 }
+
